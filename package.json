@@ -1,0 +1,20 @@
+{
+  "name": "logboard-cli",
+  "version": "1.0.0",
+  "description": "Terminal version of LogBoard — manage Apex debug trace flags and view/search Salesforce debug logs from your shell.",
+  "type": "module",
+  "bin": {
+    "logboard": "bin/logboard.js"
+  },
+  "scripts": {
+    "start": "node bin/logboard.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81"
+  },
+  "license": "MIT"
+}
