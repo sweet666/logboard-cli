@@ -30,13 +30,6 @@ npm link
 
 Or skip linking entirely and run `node bin/logboard.js`.
 
-## Authenticate
-
-```bash
-sf org login web                   # once per org
-sf config set target-org=<alias>   # optional: set a default org
-```
-
 ## Run
 
 ```bash
@@ -58,7 +51,7 @@ Pick how long debug logging stays on with the duration keys `1`–`5` (1, 2, 3, 
 
 ### Org switching
 
-Press `o` (from the log list) to open a picker of every org your Salesforce CLI is authenticated against, with the default and current org marked. Select one with `↵` to re-authenticate and reload against that org, or `esc` to cancel. You can also choose the org up front with `--org <alias>`.
+Press `o` (from the log list) to open a picker of every org your Salesforce CLI is authenticated against, with the default and current org marked. Select one with `↵` to re-authenticate and reload against that org, or `esc` to cancel. Selecting an org also **sets it as your Salesforce CLI default** (`sf config set target-org=<alias> --global`), so it stays selected the next time you run `logboard` — or any other `sf` command. If the switch succeeds but the default can't be saved, the app still switches for the session and shows a warning. You can also choose the org up front with `--org <alias>`.
 
 ### Live log list
 
@@ -99,7 +92,7 @@ Press `x` to delete up to 100 logs from the org (with a confirmation prompt).
 | `e` / `s` | Enable / stop debug logging |
 | `u` | Toggle traced user between current user and automated process (`autoproc`) |
 | `c` | Trace a specific user by username/alias (blank = keep current) |
-| `o` | Select / switch the connected Salesforce org |
+| `o` | Select / switch the connected Salesforce org (also sets it as the CLI default) |
 | `↵` | View the selected log |
 | `w` | Download the selected log to your Downloads folder |
 | `m` | Toggle select-text mode |
@@ -149,7 +142,7 @@ Log events are colour-coded by type:
 
 LogBoard CLI is a single-process Node app with a clear split of responsibilities:
 
-- **Session (`sf.js`)** — resolves the access token, instance URL, and org alias from the local Salesforce CLI (`sf org display`), transparently handling redacted tokens, and lists every authenticated org for the in-app org switcher.
+- **Session (`sf.js`)** — resolves the access token, instance URL, and org alias from the local Salesforce CLI (`sf org display`), transparently handling redacted tokens, lists every authenticated org for the in-app org switcher, and persists the chosen org as the CLI's global default.
 - **API client (`api.js`)** — a thin HTTP client over the Salesforce **Tooling/REST APIs**. It resolves users, queries and creates/updates `TraceFlag` records to start and stop debug logging, queries `ApexLog` records (joining in user names), fetches raw log bodies, and deletes logs.
 - **Formatting (`logFormat.js`)** — pure functions that split a raw log into colour-classified lines, filter to debug-only output, and run the cross-log search that returns each match with surrounding context.
 - **TUI (`ui.js`)** — a [blessed](https://github.com/chjj/blessed) full-screen interface that wires the above together: the header/status bars, the auto-refreshing log table, the scrollable viewer, the search overlay, and all key bindings.
@@ -181,4 +174,4 @@ npm test
 - Some CLI versions **redact** the access token in `sf org display`. LogBoard detects this and automatically runs the command the CLI recommends (e.g. `sf org auth show-access-token`), bypassing its confirmation prompt, so no extra setup is needed.
 - The log list auto-refreshes every 3 seconds. Log bodies are cached per session and reused across refreshes.
 - Search loads every listed log's body on first use, which may take a moment for 100 large logs.
-- Switching orgs resets the traced user to "current" and clears the cached log bodies.
+- Switching orgs resets the traced user to "current" and clears the cached log bodies, and sets the selected org as the CLI's global default (so the choice persists across runs).
