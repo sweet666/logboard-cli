@@ -429,6 +429,9 @@ export class LogBoardUI {
     this.viewer.setLabel(label || ' Log View ');
     this.viewer.setContent(toBlessed(segments));
     this.viewer.hidden = false;
+    // The viewer overlay fully covers the table; hiding it keeps blessed from
+    // re-rendering a large list on every scroll, which keeps scrolling smooth.
+    this.table.hidden = true;
     this.viewer.focus();
     // Render first so blessed computes wrapped-line metrics, then scroll to the
     // target line (mapped through wrapping), keeping a few lines of context.
@@ -451,7 +454,10 @@ export class LogBoardUI {
 
   _closeViewer() {
     this.viewer.hidden = true;
+    this.table.hidden = false;
     this._mode = null;
+    // Header repaints were paused while viewing; refresh it now it's visible.
+    this.renderHeader();
     this.table.focus();
     this.setStatus('Ready');
   }
@@ -548,6 +554,7 @@ export class LogBoardUI {
       '{gray-fg}←/→ or n/p: prev/next match   ↵ or o: open full log   w: download   esc: close{/gray-fg}';
     this.viewer.setContent(`${hint}\n\n${toBlessed(lines)}`);
     this.viewer.hidden = false;
+    this.table.hidden = true;
     this.viewer.setScroll(0);
     this.viewer.focus();
     this.screen.render();
@@ -847,7 +854,10 @@ export class LogBoardUI {
           this.traceFlag.active = false;
           this.traceFlag.expirationDate = null;
         }
-        this.renderHeader();
+        // A header repaint forces a full screen.render(), which re-parses and
+        // re-wraps the large log viewer and makes scrolling stutter. The header
+        // is covered by the viewer anyway, so defer the repaint until it closes.
+        if (this.viewer.hidden) this.renderHeader();
       }
     }, 1000);
 
@@ -855,7 +865,13 @@ export class LogBoardUI {
     // keeping the cursor and cached bodies; skips while a prompt is open, a
     // refresh is already in flight, or text selection is active.
     this._autoRefreshTimer = setInterval(() => {
-      if (!this.autoRefresh || this._refreshing || this._promptOpen || this._selectionMode)
+      if (
+        !this.autoRefresh ||
+        this._refreshing ||
+        this._promptOpen ||
+        this._selectionMode ||
+        !this.viewer.hidden // viewing a log: don't reload/repaint mid-scroll
+      )
         return;
       this.refreshLogs({ silent: true, clearCache: false });
     }, this.autoRefreshMs);
