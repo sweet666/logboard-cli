@@ -6,7 +6,7 @@ import { writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getSession, listOrgs } from './sf.js';
+import { getSession, listOrgs, setDefaultOrg } from './sf.js';
 import { SalesforceClient } from './api.js';
 import { formatLog, searchLogs, toBlessed } from './logFormat.js';
 
@@ -662,7 +662,7 @@ export class LogBoardUI {
       width: '70%',
       height: '60%',
       border: { type: 'line' },
-      label: ' Select org — ↵ switch, esc cancel ',
+      label: ' Select org — ↵ switch + set default, esc cancel ',
       tags: true,
       keys: true,
       vi: true,
@@ -712,8 +712,17 @@ export class LogBoardUI {
       this.renderTable();
       await this.initTrace();
       await this.refreshLogs();
-      if (!this._initError) {
-        this.setStatus(`Switched to ${this.client.alias || this.client.username}`, 'green');
+
+      // Persist the selection as the CLI's default org so it sticks next run.
+      const label = this.client.alias || this.client.username;
+      try {
+        await setDefaultOrg(target);
+        if (!this._initError) {
+          this.setStatus(`Switched to ${label} — set as default org`, 'green');
+        }
+      } catch (defErr) {
+        // Switching still worked; only the persistence failed.
+        this.setStatus(`Switched to ${label} (could not set default: ${defErr.message})`, 'yellow');
       }
     } catch (e) {
       this.setStatus(`Switch error: ${e.message}`, 'red');

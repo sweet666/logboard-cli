@@ -130,6 +130,35 @@ export async function getSession(orgAlias) {
   return { accessToken, instanceUrl, username, alias };
 }
 
+// The CLI's own stderr explains *why* a command failed far better than the
+// generic "Command failed: …" line Node puts in err.message, so prefer it.
+function cliError(err) {
+  const detail = String(err.stderr || err.stdout || err.message || '').trim();
+  return detail.split('\n').filter(Boolean).pop() || err.message;
+}
+
+/**
+ * Persist an org as the CLI's default target org, so it stays selected across
+ * future runs (equivalent to `sf config set target-org <alias> --global`).
+ *
+ * `--global` is required: without it, `sf config set` writes project-local
+ * config and fails when LogBoard isn't run from inside a Salesforce DX project.
+ * @param {string} target org alias or username to make default.
+ */
+export async function setDefaultOrg(target) {
+  if (!target) throw new Error('No org specified to set as default.');
+  try {
+    await runCliRaw('sf', ['config', 'set', `target-org=${target}`, '--global']);
+  } catch (sfErr) {
+    // Fall back to the legacy sfdx config key.
+    try {
+      await runCliRaw('sfdx', ['config:set', `defaultusername=${target}`, '--global']);
+    } catch (sfdxErr) {
+      throw new Error(`Could not set default org: ${cliError(sfErr)}`);
+    }
+  }
+}
+
 /**
  * List the orgs the CLI is authenticated against.
  * @returns {Promise<Array<{alias:string, username:string, instanceUrl:string, isDefault:boolean, connectedStatus:string}>>}
