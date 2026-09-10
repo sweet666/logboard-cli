@@ -36,8 +36,15 @@ Or skip linking entirely and run `node bin/logboard.js`.
 logboard                    # uses your default org
 logboard --org myDevHub     # specific org alias/username
 logboard --api v60.0        # override API version
+logboard --version          # print the version
 node bin/logboard.js        # without npm link
 ```
+
+No default org set? LogBoard still runs. If exactly one org is authenticated it's
+used automatically; if several are, LogBoard opens the org picker on launch and
+saves your choice as the global default. (Note the CLI's global default is
+separate from the project-local default VS Code sets — that one only applies
+inside the project folder.) You can always skip the picker with `--org <alias>`.
 
 ## Features
 
@@ -56,6 +63,8 @@ Press `o` (from the log list) to open a picker of every org your Salesforce CLI 
 ### Live log list
 
 The most recent 100 `ApexLog` records are shown with start time, operation, status, user, and size. The list **auto-refreshes every 3 seconds** in the background — it keeps your cursor on the same log and reuses cached log bodies, and quietly reports when new logs arrive.
+
+Press `r` to reload immediately, or `a` to pause and resume the background poll (handy when the repaint gets in the way, or to stop hitting the org while you read). The header shows `refresh: auto 3s` or `refresh: paused`.
 
 ### Log viewer
 
@@ -80,7 +89,7 @@ Terminal apps capture the mouse, which blocks native click-drag selection. Press
 
 ### Delete logs
 
-Press `x` to delete up to 100 logs from the org (with a confirmation prompt).
+Press `x` to delete every log currently listed (with a confirmation prompt showing the count). Deletes go out in batches of 200 via the sObject Collections API rather than one request per log, and partial failures are reported instead of being swallowed — deleting another user's logs, for example, will fail for those records and succeed for the rest.
 
 ## Keys
 
@@ -97,6 +106,8 @@ Press `x` to delete up to 100 logs from the org (with a confirmation prompt).
 | `w` | Download the selected log to your Downloads folder |
 | `m` | Toggle select-text mode |
 | `/` | Search across all loaded logs |
+| `r` | Refresh the log list now |
+| `a` | Pause / resume auto-refresh |
 | `x` | Delete logs from the org |
 | `q` | Quit |
 
@@ -145,6 +156,7 @@ LogBoard CLI is a single-process Node app with a clear split of responsibilities
 - **Session (`sf.js`)** — resolves the access token, instance URL, and org alias from the local Salesforce CLI (`sf org display`), transparently handling redacted tokens, lists every authenticated org for the in-app org switcher, and persists the chosen org as the CLI's global default.
 - **API client (`api.js`)** — a thin HTTP client over the Salesforce **Tooling/REST APIs**. It resolves users, queries and creates/updates `TraceFlag` records to start and stop debug logging, queries `ApexLog` records (joining in user names), fetches raw log bodies, and deletes logs.
 - **Formatting (`logFormat.js`)** — pure functions that split a raw log into colour-classified lines, filter to debug-only output, and run the cross-log search that returns each match with surrounding context.
+- **Cache (`lruCache.js`)** — a byte-budgeted LRU that bounds how much log text stays in memory (64 MB by default), so a session spent browsing 100 multi-megabyte logs doesn't grow without limit.
 - **TUI (`ui.js`)** — a [blessed](https://github.com/chjj/blessed) full-screen interface that wires the above together: the header/status bars, the auto-refreshing log table, the scrollable viewer, the search overlay, and all key bindings.
 
 Trace flags use the `SFDC_DevConsole` debug level, the same one the Salesforce Developer Console uses, so logs captured here match what you'd see there.
@@ -158,8 +170,9 @@ logboard-cli/
 │   ├── sf.js            # CLI session resolution, token retrieval, org listing
 │   ├── api.js           # Tooling/REST API client
 │   ├── logFormat.js     # parsing, colour coding, search (pure functions)
+│   ├── lruCache.js      # byte-budgeted cache for log bodies
 │   └── ui.js            # blessed full-screen TUI
-└── test/logFormat.test.js
+└── test/                # unit tests (api, logFormat, lruCache, sf)
 ```
 
 ## Test
@@ -172,6 +185,7 @@ npm test
 
 - Authentication reuses the Salesforce CLI session — current user, instance URL, and org alias all come from `sf org display`.
 - Some CLI versions **redact** the access token in `sf org display`. LogBoard detects this and automatically runs the command the CLI recommends (e.g. `sf org auth show-access-token`), bypassing its confirmation prompt, so no extra setup is needed.
-- The log list auto-refreshes every 3 seconds. Log bodies are cached per session and reused across refreshes.
-- Search loads every listed log's body on first use, which may take a moment for 100 large logs.
+- The log list auto-refreshes every 3 seconds (toggle with `a`, reload now with `r`). Log bodies are cached per session and reused across refreshes, up to a 64 MB budget — past that, the least recently viewed bodies are dropped and refetched on demand.
+- If the Salesforce CLI session expires mid-run, LogBoard detects the `401`, silently re-resolves the session for the current org, and replays the request. It only tells you if the renewal itself fails.
+- Search loads every listed log's body on first use, which may take a moment for 100 large logs. It processes one log at a time and reports progress as it goes, keeping only the matches rather than assembling every body up front.
 - Switching orgs resets the traced user to "current" and clears the cached log bodies, and sets the selected org as the CLI's global default (so the choice persists across runs).

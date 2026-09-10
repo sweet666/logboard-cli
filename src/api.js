@@ -6,14 +6,56 @@ const API_VERSION = 'v60.0';
 const AUTOMATED_USER_ALIAS = 'autoproc';
 const DEV_CONSOLE_LEVEL = 'SFDC_DevConsole';
 
+// sObject Collections accepts at most 200 ids per request.
+const COLLECTION_LIMIT = 200;
+
+// Statuses that mean "this org/API version doesn't offer that endpoint for
+// this object" — the only case where retrying one record at a time can help.
+const UNSUPPORTED_ENDPOINT_STATUSES = new Set([400, 404, 405, 501]);
+
+/**
+ * Escape a value for use inside a single-quoted SOQL string literal.
+ * SOQL only requires backslash and quote characters to be escaped; without
+ * this, a username containing an apostrophe (or a deliberately crafted one)
+ * breaks out of the literal and changes the query.
+ * @param {unknown} value
+ */
+export function soqlString(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+/** Split an array into chunks of at most `size` items. */
+export function chunk(items, size) {
+  const step = Math.max(1, Math.floor(size) || 1); // a 0 step would loop forever
+  const out = [];
+  for (let i = 0; i < items.length; i += step) out.push(items.slice(i, i + step));
+  return out;
+}
+
 export class SalesforceClient {
-  /** @param {{accessToken:string, instanceUrl:string, username:string, alias?:string}} session */
-  constructor(session, apiVersion = API_VERSION) {
+  /**
+   * @param {{accessToken:string, instanceUrl:string, username:string, alias?:string}} session
+   * @param {string} [apiVersion]
+   * @param {{onUnauthorized?: () => Promise<string|null>}} [opts]
+   *   onUnauthorized — called once when the org rejects the token with 401, and
+   *   expected to resolve a fresh access token (or null to give up). Lets the
+   *   app survive the CLI session expiring mid-run instead of failing every
+   *   subsequent call.
+   */
+  constructor(session, apiVersion, { onUnauthorized } = {}) {
     this.token = session.accessToken;
     this.instanceUrl = session.instanceUrl.replace(/\/$/, '');
     this.username = session.username;
     this.alias = session.alias || '';
-    this.apiVersion = apiVersion;
+    // A default parameter wouldn't catch null, which callers can produce when
+    // no --api was supplied; that would put "null" straight into request URLs.
+    this.apiVersion = apiVersion || API_VERSION;
+    this.onUnauthorized = onUnauthorized || null;
+    // Shared across concurrent 401s so a burst of failing requests triggers a
+    // single re-auth rather than one CLI invocation each.
+    this._refreshPromise = null;
   }
 
   get toolingBase() {
@@ -24,9 +66,34 @@ export class SalesforceClient {
     return `${this.instanceUrl}/services/data/${this.apiVersion}`;
   }
 
-  async _request(url, { method = 'GET', body, raw = false } = {}) {
+  /**
+   * Ask the host app for a fresh access token, at most once per burst.
+   * @returns {Promise<string|null>} the new token, or null if unavailable.
+   */
+  async _refreshToken() {
+    if (!this.onUnauthorized) return null;
+    if (!this._refreshPromise) {
+      this._refreshPromise = Promise.resolve()
+        .then(() => this.onUnauthorized())
+        .then((token) => {
+          if (token) this.token = token;
+          return token || null;
+        })
+        .catch(() => null)
+        .finally(() => {
+          this._refreshPromise = null;
+        });
+    }
+    return this._refreshPromise;
+  }
+
+  async _request(url, { method = 'GET', body, raw = false, _retried = false } = {}) {
+    // Remember which token this attempt used, so a 401 that arrives after a
+    // concurrent request already refreshed can be replayed without spawning a
+    // second `sf` invocation of its own.
+    const tokenUsed = this.token;
     const headers = {
-      Authorization: `Bearer ${this.token}`,
+      Authorization: `Bearer ${tokenUsed}`,
       'Content-Type': 'application/json',
     };
     const res = await fetch(url, {
@@ -36,8 +103,20 @@ export class SalesforceClient {
     });
 
     if (!res.ok) {
+      // An expired CLI session shows up as 401 on every call. Refresh once and
+      // replay the request so a long-running session heals itself.
+      if (res.status === 401 && !_retried) {
+        if (this.token !== tokenUsed) {
+          // Someone else already refreshed while this was in flight.
+          return this._request(url, { method, body, raw, _retried: true });
+        }
+        const token = await this._refreshToken();
+        if (token) return this._request(url, { method, body, raw, _retried: true });
+      }
       const text = await res.text();
-      throw new Error(`Salesforce API ${res.status}: ${text}`);
+      const err = new Error(`Salesforce API ${res.status}: ${text}`);
+      err.status = res.status;
+      throw err;
     }
 
     if (raw) return res.text();
@@ -62,7 +141,7 @@ export class SalesforceClient {
     // token and returns "403 Missing_OAuth_Token" for some `sf org display`
     // sessions, even though the same token works for the query API below.
     if (this.username) {
-      const soql = `SELECT Id FROM User WHERE Username = '${this.username}' LIMIT 1`;
+      const soql = `SELECT Id FROM User WHERE Username = '${soqlString(this.username)}' LIMIT 1`;
       const data = await this.query(soql);
       if (data.records && data.records.length) return data.records[0].Id;
     }
@@ -72,7 +151,8 @@ export class SalesforceClient {
   }
 
   async getUserIdByUsernameOrAlias(value) {
-    const soql = `SELECT Id FROM User WHERE Username = '${value}' OR Alias = '${value}' LIMIT 1`;
+    const v = soqlString(value);
+    const soql = `SELECT Id FROM User WHERE Username = '${v}' OR Alias = '${v}' LIMIT 1`;
     const data = await this.query(soql);
     if (!data.records.length) throw new Error(`No user found for "${value}".`);
     return data.records[0].Id;
@@ -107,7 +187,7 @@ export class SalesforceClient {
   async getActiveTraceFlag(userId) {
     const soql =
       `SELECT Id, ExpirationDate, TracedEntityId FROM TraceFlag ` +
-      `WHERE LogType = 'USER_DEBUG' AND TracedEntityId = '${userId}'`;
+      `WHERE LogType = 'USER_DEBUG' AND TracedEntityId = '${soqlString(userId)}'`;
     const data = await this.query(soql, { tooling: true });
 
     if (data.records && data.records.length) {
@@ -173,7 +253,10 @@ export class SalesforceClient {
 
   /**
    * Most recent 100 ApexLog records, with user names resolved.
-   * @param {string} [filter] optional extra SOQL WHERE clause.
+   * @param {string} [filter] optional extra SOQL WHERE clause. This is a raw
+   *   clause, not a value, so it is interpolated verbatim and cannot be
+   *   escaped — only pass a clause this code constructed. Never pass user
+   *   input straight through; build it from `soqlString`-escaped literals.
    */
   async getDebugLogs(filter = '') {
     let soql =
@@ -187,7 +270,7 @@ export class SalesforceClient {
 
     let userMap = {};
     if (userIds.length) {
-      const inList = userIds.map((id) => `'${id}'`).join(',');
+      const inList = userIds.map((id) => `'${soqlString(id)}'`).join(',');
       const users = await this.query(
         `SELECT Id, Name FROM User WHERE Id IN (${inList})`
       );
@@ -215,12 +298,74 @@ export class SalesforceClient {
     });
   }
 
-  /** Delete up to 100 logs. */
+  /**
+   * Delete logs, preferring the sObject Collections endpoint (200 ids per
+   * call) over one request per record. Falls back to per-record DELETEs if the
+   * org rejects the collections call, so this works regardless of API version.
+   * @param {string[]} ids
+   * @returns {Promise<{deleted:number, failed:Array<{id:string, error:string}>}>}
+   */
   async deleteDebugLogs(ids) {
-    for (const id of ids) {
-      await this._request(`${this.dataBase}/sobjects/ApexLog/${id}`, {
-        method: 'DELETE',
-      });
+    const list = (ids || []).filter(Boolean);
+    if (!list.length) return { deleted: 0, failed: [] };
+
+    const failed = [];
+    let deleted = 0;
+
+    for (const batch of chunk(list, COLLECTION_LIMIT)) {
+      let results;
+      try {
+        // allOrNone=false so one undeletable log doesn't abort the whole batch.
+        const url =
+          `${this.dataBase}/composite/sobjects?allOrNone=false` +
+          `&ids=${batch.map(encodeURIComponent).join(',')}`;
+        results = await this._request(url, { method: 'DELETE' });
+      } catch (err) {
+        // Only retry record-by-record when the *endpoint* looks unsupported.
+        // Falling back on an auth or network failure would replay the same
+        // failure up to 200 more times (and re-auth on each one), burying the
+        // real cause, so those propagate untouched.
+        if (!UNSUPPORTED_ENDPOINT_STATUSES.has(err.status)) throw err;
+        const fallback = await this._deleteOneByOne(batch);
+        deleted += fallback.deleted;
+        failed.push(...fallback.failed);
+        continue;
+      }
+
+      // Collections returns a per-record result array, not an HTTP error, when
+      // individual deletes fail — so successes must be counted per record.
+      for (let i = 0; i < batch.length; i++) {
+        const r = (results && results[i]) || {};
+        if (r.success) deleted++;
+        else failed.push({ id: batch[i], error: describeSaveErrors(r.errors) });
+      }
     }
+
+    return { deleted, failed };
   }
+
+  /** Per-record DELETE fallback; never throws, reports failures per id. */
+  async _deleteOneByOne(ids) {
+    const failed = [];
+    let deleted = 0;
+    for (const id of ids) {
+      try {
+        await this._request(`${this.dataBase}/sobjects/ApexLog/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        deleted++;
+      } catch (err) {
+        failed.push({ id, error: err.message });
+      }
+    }
+    return { deleted, failed };
+  }
+}
+
+/** Flatten the Collections API's per-record error array into one line. */
+function describeSaveErrors(errors) {
+  if (!Array.isArray(errors) || !errors.length) return 'Unknown error';
+  return errors
+    .map((e) => [e.statusCode, e.message].filter(Boolean).join(': '))
+    .join('; ');
 }

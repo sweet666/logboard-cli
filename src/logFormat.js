@@ -85,19 +85,3 @@ export function toBlessed(segments) {
     })
     .join('\n');
 }
-
-const ANSI = {
-  '#e6db74': '\x1b[38;5;185m',
-  '#ae81ff': '\x1b[38;5;141m',
-  '#66d9ef': '\x1b[38;5;81m',
-  '#a6e22e': '\x1b[38;5;148m',
-  '#ff5555': '\x1b[38;5;203m',
-};
-const RESET = '\x1b[0m';
-
-/** Render segments with raw ANSI escape codes (for plain output / piping). */
-export function toAnsi(segments) {
-  return segments
-    .map(({ text, color }) => (color && ANSI[color] ? ANSI[color] + text + RESET : text))
-    .join('\n');
-}

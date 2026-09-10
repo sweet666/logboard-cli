@@ -8,9 +8,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { getSession, listOrgs, setDefaultOrg } from './sf.js';
 import { SalesforceClient } from './api.js';
+import { LruCache } from './lruCache.js';
 import { formatLog, searchLogs, toBlessed } from './logFormat.js';
 
 const DURATIONS = [1, 2, 3, 5, 10]; // minutes
+const BODY_CACHE_BYTES = 64 * 1024 * 1024; // cap on cached log bodies
+const REAUTH_COOLDOWN_MS = 60 * 1000; // don't retry a failed re-auth for a minute
 
 function fmtRemaining(ms) {
   if (ms <= 0) return '00:00';
@@ -21,15 +24,28 @@ function fmtRemaining(ms) {
 }
 
 export class LogBoardUI {
-  /** @param {import('./api.js').SalesforceClient} client */
-  constructor(client) {
+  /**
+   * @param {import('./api.js').SalesforceClient|null} client active client, or
+   *   null to start without a session (the app opens the org picker on launch).
+   * @param {string} [apiVersion] API version to use when a client is picked
+   *   later; defaults to the client's own version when one is supplied.
+   */
+  constructor(client, apiVersion) {
     this.client = client;
+    // `client && client.apiVersion` yields null (not undefined) when there is
+    // no client yet, which would defeat SalesforceClient's default parameter
+    // and build request URLs containing the literal "null" once an org is
+    // picked. Normalise any falsy value away.
+    this.apiVersion = apiVersion || (client ? client.apiVersion : undefined);
+    // A client built in bin/ doesn't know how to re-authenticate; attach the
+    // hook here so an expired CLI session recovers instead of failing forever.
+    if (this.client) this.client.onUnauthorized = () => this._reauth();
 
     this.traceTarget = 'current';
     this.traceFlag = null; // {id, expirationDate, active}
     this.durationIndex = 0; // default 1 minute
     this.logs = [];
-    this.bodyCache = new Map();
+    this.bodyCache = new LruCache({ maxBytes: BODY_CACHE_BYTES });
     this.searchResults = [];
     this.searchIndex = 0;
     this.searchTerm = '';
@@ -125,6 +141,15 @@ export class LogBoardUI {
   // --- Rendering -------------------------------------------------------------
 
   renderHeader() {
+    if (!this.client) {
+      this.header.setContent(
+        ` {red-fg}○ No org selected{/red-fg}\n` +
+          ` {gray-fg}org:{/gray-fg} {yellow-fg}press o to select an org{/yellow-fg}`
+      );
+      this.screen.render();
+      return;
+    }
+
     const durBar = DURATIONS.map((d, i) =>
       i === this.durationIndex ? `{green-fg}{bold}[${d}]{/bold}{/green-fg}` : ` ${d} `
     ).join(' ');
@@ -147,10 +172,14 @@ export class LogBoardUI {
         : this.traceTarget;
 
     const aliasLabel = this.client.alias ? ` {gray-fg}(${this.client.alias}){/gray-fg}` : '';
+    const refreshLabel = this.autoRefresh
+      ? `{green-fg}auto ${Math.round(this.autoRefreshMs / 1000)}s{/green-fg}`
+      : '{yellow-fg}paused{/yellow-fg}';
 
     this.header.setContent(
       ` ${statusText}    Duration(min): ${durBar} min    User: {cyan-fg}${targetLabel}{/cyan-fg}\n` +
-        ` {gray-fg}org:{/gray-fg} ${this.client.username || ''}${aliasLabel}`
+        ` {gray-fg}org:{/gray-fg} ${this.client.username || ''}${aliasLabel}` +
+        `    {gray-fg}refresh:{/gray-fg} ${refreshLabel}`
     );
     this.screen.render();
   }
@@ -193,7 +222,7 @@ export class LogBoardUI {
       }
       return 'd: debug-only  w: download  m: select-text  esc: close';
     }
-    return 'e:enable s:stop 1-5:duration u:user c:custom-user o:org ↵:view w:download m:select-text /:search-in-logs x:delete q:quit';
+    return 'e:enable s:stop 1-5:duration u:user c:custom-user o:org ↵:view w:download m:select-text /:search-in-logs r:refresh a:auto-refresh x:delete q:quit';
   }
 
   setStatus(msg, color = 'white') {
@@ -206,6 +235,7 @@ export class LogBoardUI {
   // --- Data actions ----------------------------------------------------------
 
   async initTrace() {
+    if (!this.client) return;
     this.setStatus('Resolving trace flag…');
     this._initError = null;
     // Keep the in-flight promise so other actions (e.g. enable) can await it
@@ -234,7 +264,12 @@ export class LogBoardUI {
    *                prune bodies for logs that no longer exist.
    */
   async refreshLogs({ silent = false, clearCache = true } = {}) {
-    if (this._refreshing) return;
+    if (!this.client) return;
+    if (this._refreshing) {
+      // Tell the user why an explicit `r` appeared to do nothing.
+      if (!silent) this.setStatus('Refresh already in progress…', 'yellow');
+      return;
+    }
     this._refreshing = true;
     if (!silent) this.setStatus('Loading logs…');
     try {
@@ -319,6 +354,34 @@ export class LogBoardUI {
     this.renderHeader();
   }
 
+  // Re-resolve the CLI session after the org rejects the current token (401).
+  // Returns the fresh access token, or null if the CLI can't provide one — in
+  // which case the original 401 surfaces to the caller as normal.
+  async _reauth() {
+    if (!this.client) return null;
+    // The CLI often keeps serving the same dead token until the user runs
+    // `sf org login web`. Without a cooldown the 3s poll would spawn CLI
+    // subprocesses forever, so back off after a failure instead of retrying
+    // on every request.
+    if (this._reauthBlockedUntil && Date.now() < this._reauthBlockedUntil) return null;
+
+    const target = this.client.alias || this.client.username;
+    this.setStatus('Session expired — re-authenticating…', 'yellow');
+    try {
+      const session = await getSession(target);
+      this._reauthBlockedUntil = 0;
+      this.setStatus('Session renewed', 'green');
+      return session.accessToken;
+    } catch (err) {
+      this._reauthBlockedUntil = Date.now() + REAUTH_COOLDOWN_MS;
+      this.setStatus(
+        `Session expired and could not be renewed: ${err.message} — run \`sf org login web\``,
+        'red'
+      );
+      return null;
+    }
+  }
+
   async getBody(logId) {
     if (this.bodyCache.has(logId)) return this.bodyCache.get(logId);
     const body = await this.client.getLogBody(logId);
@@ -367,6 +430,19 @@ export class LogBoardUI {
     const id = this._selectedLogId();
     if (!id) return this.setStatus('No log selected', 'yellow');
     return this.downloadLog(id);
+  }
+
+  // Pause/resume the background log poll. Useful when the 3s repaint gets in
+  // the way, or to stop hitting the org while you read.
+  toggleAutoRefresh() {
+    this.autoRefresh = !this.autoRefresh;
+    this.renderHeader();
+    this.setStatus(
+      this.autoRefresh
+        ? `Auto-refresh ON (every ${Math.round(this.autoRefreshMs / 1000)}s)`
+        : 'Auto-refresh OFF — press r to reload manually',
+      this.autoRefresh ? 'green' : 'yellow'
+    );
   }
 
   // Toggle native terminal text selection. Releases the mouse so click-drag
@@ -517,13 +593,21 @@ export class LogBoardUI {
     this.searchTerm = term;
     this.setStatus(`Searching "${term}" across ${this.logs.length} logs…`);
     try {
-      // Ensure all bodies are loaded.
-      const withBodies = [];
-      for (const log of this.logs) {
+      // Search one log at a time and keep only the matches. Collecting every
+      // body into an array first would hold all 100 logs in memory at once,
+      // which defeats the point of bounding the cache.
+      const results = [];
+      for (let i = 0; i < this.logs.length; i++) {
+        const log = this.logs[i];
         const body = await this.getBody(log.id);
-        withBodies.push({ id: log.id, operation: log.operation, body });
+        results.push(...searchLogs([{ id: log.id, operation: log.operation, body }], term));
+        if (i % 10 === 9 || i === this.logs.length - 1) {
+          this.setStatus(
+            `Searching "${term}" — ${i + 1}/${this.logs.length} logs, ${results.length} matches…`
+          );
+        }
       }
-      this.searchResults = searchLogs(withBodies, term);
+      this.searchResults = results;
       this.searchIndex = 0;
       if (!this.searchResults.length) {
         this.setStatus(`No matches for "${term}"`, 'yellow');
@@ -644,7 +728,9 @@ export class LogBoardUI {
   }
 
   // Pick an org from the CLI's authenticated list and switch to it.
-  async selectOrg() {
+  // @param {{startup?:boolean}} [opts] startup mode opens the picker before any
+  //   org is selected; cancelling it quits (there's nothing to fall back to).
+  async selectOrg({ startup = false } = {}) {
     this.setStatus('Loading orgs…');
     let orgs;
     try {
@@ -654,11 +740,12 @@ export class LogBoardUI {
     }
     if (!orgs.length) return this.setStatus('No authenticated orgs found', 'yellow');
 
+    const currentUser = this.client && this.client.username;
     const items = orgs.map((o) => {
       const name = o.alias ? `${o.alias}  {gray-fg}${o.username}{/gray-fg}` : o.username;
       const marks =
         (o.isDefault ? ' {yellow-fg}(default){/yellow-fg}' : '') +
-        (o.username === this.client.username ? ' {green-fg}● current{/green-fg}' : '');
+        (o.username === currentUser ? ' {green-fg}● current{/green-fg}' : '');
       return ` ${name}${marks}`;
     });
 
@@ -680,7 +767,7 @@ export class LogBoardUI {
     });
 
     this._promptOpen = true;
-    const curIdx = orgs.findIndex((o) => o.username === this.client.username);
+    const curIdx = orgs.findIndex((o) => o.username === currentUser);
     if (curIdx >= 0) list.select(curIdx);
     list.focus();
     this.screen.render();
@@ -688,6 +775,8 @@ export class LogBoardUI {
     list.key('escape', () => {
       this._promptOpen = false;
       list.destroy();
+      // At startup there's no org to fall back to, so cancelling exits.
+      if (startup && !this.client) process.exit(0);
       this.table.focus();
       this.setStatus('Org switch cancelled');
     });
@@ -705,7 +794,10 @@ export class LogBoardUI {
     this.setStatus(`Switching to ${target}…`);
     try {
       const session = await getSession(target);
-      this.client = new SalesforceClient(session, this.client.apiVersion);
+      this.client = new SalesforceClient(session, this.apiVersion, {
+        onUnauthorized: () => this._reauth(),
+      });
+      this.apiVersion = this.client.apiVersion;
       // Reset everything tied to the previous org.
       this.traceTarget = 'current';
       this.traceFlag = null;
@@ -751,16 +843,37 @@ export class LogBoardUI {
       style: { border: { fg: 'red' } },
     });
     this._promptOpen = true;
-    question.ask('Delete up to 100 logs from the org? (y/N)', async (err, ok) => {
-      this._promptOpen = false;
-      if (!ok) return this.setStatus('Delete cancelled');
-      this.setStatus('Deleting…');
+    const count = this.logs.length;
+    question.ask(`Delete all ${count} listed log${count === 1 ? '' : 's'}? (y/N)`, async (err, ok) => {
+      if (!ok) {
+        this._promptOpen = false;
+        return this.setStatus('Delete cancelled');
+      }
+      this.setStatus(`Deleting ${count} logs…`);
       try {
-        await this.client.deleteDebugLogs(this.logs.map((l) => l.id));
-        this.setStatus('Logs deleted', 'green');
+        const { deleted, failed } = await this.client.deleteDebugLogs(
+          this.logs.map((l) => l.id)
+        );
+        // Only now release the input lock: keeping it held for the whole
+        // delete stops a second `x` press and stops the background poll from
+        // occupying refreshLogs, which would make the reload below a no-op and
+        // leave deleted rows on screen.
+        this._promptOpen = false;
         await this.refreshLogs();
+        // Partial failures are normal (another user's logs, locked records),
+        // so report them rather than claiming a clean sweep.
+        if (failed.length) {
+          this.setStatus(
+            `Deleted ${deleted}, ${failed.length} failed — ${failed[0].error}`,
+            'yellow'
+          );
+        } else {
+          this.setStatus(`Deleted ${deleted} log${deleted === 1 ? '' : 's'}`, 'green');
+        }
       } catch (e) {
         this.setStatus(`Delete error: ${e.message}`, 'red');
+      } finally {
+        this._promptOpen = false;
       }
     });
   }
@@ -795,6 +908,8 @@ export class LogBoardUI {
 
     s.key('e', () => this._canAct() && this.enable());
     s.key('s', () => this._canAct() && this.stop());
+    s.key('r', () => this._canAct() && this.refreshLogs());
+    s.key('a', () => this._canAct() && this.toggleAutoRefresh());
     s.key('u', () => this._canAct() && this.cycleUser());
     s.key('c', () => this._canAct() && this.enterCustomUser());
     s.key('x', () => this._canAct() && this.deleteLogs());
@@ -841,7 +956,7 @@ export class LogBoardUI {
 
   // --- Entry point -----------------------------------------------------------
 
-  async start() {
+  async start({ pickOrg = false } = {}) {
     this.renderHeader();
     this.renderTable();
     this.setStatus('Starting…');
@@ -875,6 +990,14 @@ export class LogBoardUI {
         return;
       this.refreshLogs({ silent: true, clearCache: false });
     }, this.autoRefreshMs);
+
+    // No session yet (no default org, several authenticated): open the picker
+    // instead of trying to load logs against a client that doesn't exist.
+    if (!this.client || pickOrg) {
+      this.setStatus('No default org set — select an org to begin', 'yellow');
+      await this.selectOrg({ startup: true });
+      return;
+    }
 
     await this.initTrace();
     await this.refreshLogs();

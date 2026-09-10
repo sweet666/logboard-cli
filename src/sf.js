@@ -38,8 +38,13 @@ function extractToken(text) {
  * token in `org display`, replacing it with a hint like
  *   "[REDACTED] Use 'sf org auth show-access-token' to view"
  * so we run whatever command the CLI itself recommends to get the real value.
+ *
+ * @param {string} displayToken the (possibly redacted) token from `org display`.
+ * @param {string} [target] org alias or username to reveal the token for. Pass
+ *   the org that `org display` actually resolved — the reveal command needs an
+ *   explicit `--target-org` when the CLI has no global default.
  */
-async function resolveAccessToken(displayToken, orgAlias) {
+async function resolveAccessToken(displayToken, target) {
   if (looksLikeToken(displayToken)) return displayToken.trim();
 
   // Parse the suggested command out of the CLI's own redaction message.
@@ -54,7 +59,10 @@ async function resolveAccessToken(displayToken, orgAlias) {
   const parts = cmdMatch[1].trim().split(/\s+/);
   const bin = parts[0];
   const baseCmdArgs = parts.slice(1);
-  if (orgAlias) baseCmdArgs.push('--target-org', orgAlias);
+  // Don't duplicate the flag if the CLI already suggested it.
+  if (target && !baseCmdArgs.some((a) => a === '--target-org' || a === '-o')) {
+    baseCmdArgs.push('--target-org', target);
+  }
 
   // The reveal command guards behind an interactive confirmation prompt, which
   // times out when run non-interactively ("confirmation denied or timed out").
@@ -71,7 +79,8 @@ async function resolveAccessToken(displayToken, orgAlias) {
   }
   if (out === undefined) {
     throw new Error(
-      `Could not retrieve the access token via \`${cmdMatch[1]}\`: ${lastErr.message}`
+      `Could not retrieve the access token via \`${cmdMatch[1]}\`` +
+        `${target ? ` --target-org ${target}` : ''}: ${cliError(lastErr)}`
     );
   }
 
@@ -86,29 +95,99 @@ async function resolveAccessToken(displayToken, orgAlias) {
 }
 
 /**
- * Resolve an access token + instance URL from the local CLI auth.
- * @param {string} [orgAlias] optional org alias / username; defaults to the CLI default org.
- * @returns {Promise<{accessToken: string, instanceUrl: string, username: string, alias: string}>}
+ * Run `org display` for a specific org (or the CLI default when omitted),
+ * falling back to the legacy `sfdx` command shape. Throws a friendly error
+ * (tagged with `.cause`) when neither CLI can produce a session.
+ * @param {string} [orgAlias]
  */
-export async function getSession(orgAlias) {
+async function orgDisplay(orgAlias) {
   const baseArgs = ['org', 'display', '--json'];
   if (orgAlias) baseArgs.push('--target-org', orgAlias);
 
-  let result;
   try {
-    result = await runCliJson('sf', baseArgs);
+    return await runCliJson('sf', baseArgs);
   } catch (sfErr) {
     // Fall back to the legacy sfdx CLI shape if `sf` is unavailable.
     try {
       const legacyArgs = ['force:org:display', '--json'];
       if (orgAlias) legacyArgs.push('-u', orgAlias);
-      result = await runCliJson('sfdx', legacyArgs);
+      return await runCliJson('sfdx', legacyArgs);
     } catch (sfdxErr) {
-      throw new Error(
+      const err = new Error(
         'Could not get a Salesforce session. Make sure the Salesforce CLI is ' +
           'installed and you have authenticated an org (`sf org login web`).\n' +
           `sf error: ${sfErr.message}`
       );
+      err.cause = sfErr;
+      throw err;
+    }
+  }
+}
+
+/**
+ * Pure org-selection policy for the no-default case. Given the authenticated
+ * orgs, decide which one LogBoard should use:
+ *   - restrict to connected orgs when any report "Connected";
+ *   - pick the CLI's flagged default, else the sole candidate;
+ *   - otherwise report the choice as ambiguous so the caller opens the picker.
+ * @param {Array<{alias?:string, username:string, isDefault?:boolean, connectedStatus?:string}>} orgs
+ * @returns {{target: string} | {ambiguous: true, orgs: Array} | {empty: true}}
+ */
+export function chooseOrgTarget(orgs) {
+  const list = Array.isArray(orgs) ? orgs : [];
+  const connected = list.filter((o) => /^connected$/i.test(o.connectedStatus || ''));
+  const pool = connected.length ? connected : list;
+  if (pool.length === 0) return { empty: true };
+
+  const chosen = pool.find((o) => o.isDefault) || (pool.length === 1 ? pool[0] : null);
+  if (chosen) return { target: chosen.alias || chosen.username };
+  return { ambiguous: true, orgs: pool };
+}
+
+/**
+ * When no default org is configured, resolve a target from the authenticated
+ * org list so LogBoard runs anyway. Returns an alias/username to use, or throws
+ * `NO_DEFAULT_ORG` (with `.orgs`) when the choice is ambiguous so the caller can
+ * open the org picker. Surfaces the original error if the CLI can't list orgs.
+ * @param {Error} originalErr the error from the default `org display`.
+ */
+async function resolveTargetWithoutDefault(originalErr) {
+  let orgs;
+  try {
+    orgs = await listOrgs();
+  } catch {
+    // The CLI itself is missing/unusable — the org-display error is truer.
+    throw originalErr;
+  }
+
+  const choice = chooseOrgTarget(orgs);
+  if (choice.target) return choice.target;
+  if (choice.empty) throw originalErr;
+
+  const err = new Error('No default org set and multiple orgs are authenticated.');
+  err.code = 'NO_DEFAULT_ORG';
+  err.orgs = choice.orgs;
+  throw err;
+}
+
+/**
+ * Resolve an access token + instance URL from the local CLI auth.
+ * @param {string} [orgAlias] optional org alias / username; defaults to the CLI default org.
+ * @returns {Promise<{accessToken: string, instanceUrl: string, username: string, alias: string}>}
+ */
+export async function getSession(orgAlias) {
+  let result;
+  if (orgAlias) {
+    result = await orgDisplay(orgAlias);
+  } else {
+    // No explicit org. Use the CLI default if one is set; otherwise fall back
+    // to the authenticated org list so LogBoard runs without a default org
+    // (e.g. when the default only exists project-locally, as VS Code sets it).
+    try {
+      result = await orgDisplay();
+    } catch (noDefaultErr) {
+      const target = await resolveTargetWithoutDefault(noDefaultErr);
+      result = await orgDisplay(target);
     }
   }
 
@@ -125,7 +204,13 @@ export async function getSession(orgAlias) {
   }
 
   // The token in `org display` is often redacted; resolve the real one.
-  const accessToken = await resolveAccessToken(data.accessToken, orgAlias);
+  // Always pass a concrete target: the reveal command (`sf org auth
+  // show-access-token`) has no fallback to "whatever org display just used",
+  // so without `--target-org` it fails with NoDefaultEnvError whenever the CLI
+  // has no global default — exactly the case `resolveTargetWithoutDefault`
+  // handles above. `username` is always returned by `org display`, and unlike
+  // an alias it's guaranteed to be set.
+  const accessToken = await resolveAccessToken(data.accessToken, orgAlias || username);
 
   return { accessToken, instanceUrl, username, alias };
 }
